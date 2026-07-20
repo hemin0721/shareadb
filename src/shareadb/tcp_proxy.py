@@ -7,6 +7,12 @@ from typing import Optional
 
 _LOG = logging.getLogger(__name__)
 
+# Minimum seconds between two WARNING logs for the same upstream-connect
+# failure. Without this, a dead forward floods the log (one WARNING per inbound
+# client retry, several per second). A successful connection resets the timer so
+# the first failure after recovery is still reported at WARNING level.
+LOG_BACKOFF_SECONDS = 5.0
+
 
 class TCPProxyServer:
     """Bidirectional TCP proxy implemented with asyncio streams."""
@@ -28,6 +34,7 @@ class TCPProxyServer:
         self._client_tasks: set[asyncio.Task[None]] = set()
         self._name = name or f"proxy:{listen_port}->{target_port}"
         self._lock = asyncio.Lock()
+        self._last_failure_log = 0.0
 
     @property
     def address(self) -> tuple[str, int]:
@@ -63,6 +70,33 @@ class TCPProxyServer:
             self._client_tasks.clear()
             _LOG.info("Stopped proxy %s", self._name)
 
+    def _log_failure(self, exc: BaseException) -> None:
+        """Log an upstream-connect failure, deduplicated to one WARNING per window.
+
+        The first failure after ``LOG_BACKOFF_SECONDS`` (or after a recovery)
+        is logged at WARNING; repeats within the window are downgraded to DEBUG
+        so a persistently-dead forward cannot flood the log.
+        """
+
+        now = asyncio.get_running_loop().time()
+        if now - self._last_failure_log >= LOG_BACKOFF_SECONDS:
+            _LOG.warning(
+                "Proxy %s failed to connect to target %s:%s: %s",
+                self._name,
+                self._target_host,
+                self._target_port,
+                exc,
+            )
+            self._last_failure_log = now
+        else:
+            _LOG.debug(
+                "Proxy %s failed to connect to target %s:%s: %s",
+                self._name,
+                self._target_host,
+                self._target_port,
+                exc,
+            )
+
     async def _handle_client(
         self,
         client_reader: asyncio.StreamReader,
@@ -76,16 +110,14 @@ class TCPProxyServer:
                 port=self._target_port,
             )
         except Exception as exc:  # pragma: no cover - network failures hard to deterministically test
-            _LOG.warning(
-                "Proxy %s failed to connect to target %s:%s: %s",
-                self._name,
-                self._target_host,
-                self._target_port,
-                exc,
-            )
+            self._log_failure(exc)
             client_writer.close()
             await client_writer.wait_closed()
             return
+
+        # A successful upstream connection resets the failure backoff timer so
+        # the next failure (after recovery) is reported promptly.
+        self._last_failure_log = 0.0
 
         async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:

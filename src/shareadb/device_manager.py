@@ -5,12 +5,49 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Sequence
 
 from .adb_client import ADBClient, ADBCommandError, ADBDeviceInfo
 from .tcp_proxy import TCPProxyServer
 
 _LOG = logging.getLogger(__name__)
+
+# Setup timing / retry policy. All timeouts are bounded so that a wedged device
+# cannot stall the event loop or block shutdown indefinitely (see _start).
+TCPIP_TIMEOUT = 10.0  # seconds for ``adb tcpip``
+POST_TCPIP_DELAY = 1.0  # let the adbd restart triggered by tcpip take effect
+RECONNECT_TIMEOUT = 5.0  # seconds for ``adb reconnect offline``
+WAIT_FOR_DEVICE_TIMEOUT = 6.0  # seconds to wait for the device to come back
+SETTLE_DELAY = 0.75  # seconds to let the transport settle before forwarding
+PROBE_TIMEOUT = 1.5  # seconds for the forward liveness probe
+RETRY_BACKOFF = 0.5  # seconds between setup attempts
+START_MAX_ATTEMPTS = 4  # wait/forward/probe retries after the single tcpip
+
+# Injectable seams (defaults point at real implementations) so the retry/probe
+# logic is unit-testable without sockets or sleeps.
+PortProbe = Callable[[str, int], Awaitable[bool]]
+Sleeper = Callable[[float], Awaitable[None]]
+
+
+async def _default_port_probe(host: str, port: int) -> bool:
+    """Return True if a TCP connection to ``(host, port)`` is accepted.
+
+    Used to verify an ``adb forward`` actually has a live listener, which the
+    ``adb forward`` exit code alone cannot prove.
+    """
+
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=PROBE_TIMEOUT
+        )
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:  # pragma: no cover - defensive; close errors are irrelevant
+        pass
+    return True
 
 
 @dataclass
@@ -53,6 +90,8 @@ class ADBDeviceSession:
         forward_port: int,
         proxy_port: int,
         listen_host: str,
+        port_probe: Optional[PortProbe] = None,
+        sleep_fn: Optional[Sleeper] = None,
     ) -> None:
         self._adb = adb_client
         self._serial = serial
@@ -71,6 +110,8 @@ class ADBDeviceSession:
         self._state = SessionState.WAITING
         self._last_error: Optional[str] = None
         self._last_info: Optional[ADBDeviceInfo] = None
+        self._port_probe: PortProbe = port_probe or _default_port_probe
+        self._sleep_fn: Sleeper = sleep_fn or asyncio.sleep
 
     @property
     def serial(self) -> str:
@@ -109,15 +150,25 @@ class ADBDeviceSession:
             last_error=self._last_error,
         )
 
-    async def ensure_running(self, info: ADBDeviceInfo) -> None:
+    async def ensure_running(self, info: ADBDeviceInfo) -> bool:
+        """Bring the session to RUNNING if it isn't already.
+
+        Returns:
+            True if the session was (re)started during this call (i.e. it
+            transitioned into RUNNING from a non-running state), False if it was
+            already RUNNING. Used by the manager to skip a redundant liveness
+            probe on freshly started sessions.
+        """
+
         async with self._lock:
             self._last_info = info
             if self._state == SessionState.RUNNING:
-                return
+                return False
             try:
                 await self._start()
                 self._state = SessionState.RUNNING
                 self._last_error = None
+                return True
             except Exception as exc:  # pragma: no cover - relies on adb/hardware failures
                 self._last_error = str(exc)
                 self._state = SessionState.ERROR
@@ -139,26 +190,94 @@ class ADBDeviceSession:
             self._state = SessionState.WAITING
 
     async def _start(self) -> None:
+        """Enable adb-over-TCP sharing for the device, retrying on transient races.
+
+        ``adb tcpip`` switches adbd into TCP mode (and persists the port), but it
+        also restarts adbd *asynchronously*: right after it returns the device is
+        still "device", then it drops offline for a moment as adbd restarts, then
+        it comes back. Two failure modes follow if this is ignored:
+
+          * ``adb forward`` issued during the offline window fails with
+            ``device '...' not found`` and leaves no listener -> the proxy then
+            sees a permanent ECONNREFUSED (the original reconnect bug).
+          * Re-running ``tcpip`` on every retry *re*-restarts adbd each time, so a
+            freshly-booted device never gets a chance to stabilize.
+
+        Therefore ``tcpip`` runs exactly ONCE; the loop below waits for the device
+        to come back from that single restart and verifies the forward before
+        starting the proxy. All awaits are bounded so a wedged device cannot stall
+        shutdown.
+        """
+
         _LOG.info(
             "Configuring adb over TCP for device %s (forward tcp:%s -> tcp:%s)",
             self._serial,
             self._forward_port,
             self._device_tcp_port,
         )
-        await self._adb.shell(
-            self._serial,
-            ["setprop", "persist.adb.tcp.port", str(self._device_tcp_port)],
+        await self._adb.run(
+            ["tcpip", str(self._device_tcp_port)],
+            device_serial=self._serial,
+            timeout=TCPIP_TIMEOUT,
         )
-        await self._adb.forward(self._serial, self._forward_port, self._device_tcp_port)
-        await self._proxy.start()
-        _LOG.info(
-            "Device %s shared on %s:%s (forward tcp:%s -> tcp:%s)",
-            self._serial,
-            self._listen_host,
-            self._proxy_port,
-            self._forward_port,
-            self._device_tcp_port,
+        # Let the adbd restart triggered by tcpip actually take effect, so the
+        # first wait-for-device below observes the offline->online transition
+        # instead of returning instantly against a not-yet-restarted adbd.
+        await self._sleep_fn(POST_TCPIP_DELAY)
+
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, START_MAX_ATTEMPTS + 1):
+            try:
+                await self._adb.reconnect_offline(timeout=RECONNECT_TIMEOUT)
+                await self._adb.wait_for_device(
+                    self._serial, timeout=WAIT_FOR_DEVICE_TIMEOUT
+                )
+                await self._sleep_fn(SETTLE_DELAY)
+                await self._adb.forward(
+                    self._serial, self._forward_port, self._device_tcp_port
+                )
+                if not await self._port_probe("127.0.0.1", self._forward_port):
+                    raise RuntimeError(
+                        f"forward tcp:{self._forward_port} did not become reachable"
+                    )
+                await self._proxy.start()
+                _LOG.info(
+                    "Device %s shared on %s:%s (forward tcp:%s -> tcp:%s, attempt %d)",
+                    self._serial,
+                    self._listen_host,
+                    self._proxy_port,
+                    self._forward_port,
+                    self._device_tcp_port,
+                    attempt,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                await self._teardown_forward()
+                if attempt < START_MAX_ATTEMPTS:
+                    _LOG.warning(
+                        "Setup attempt %d/%d for %s failed (%s: %s); retrying",
+                        attempt,
+                        START_MAX_ATTEMPTS,
+                        self._serial,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    await self._sleep_fn(RETRY_BACKOFF)
+        raise RuntimeError(
+            f"Failed to establish adb sharing for {self._serial} "
+            f"after {START_MAX_ATTEMPTS} attempts: {type(last_error).__name__}: {last_error}"
         )
+
+    async def is_forward_healthy(self) -> bool:
+        """Return True if the forward port currently accepts connections.
+
+        Read-only and lock-free (it probes an external port) so the manager can
+        run it from the sync loop to detect and self-heal a silently dead
+        forward on an otherwise RUNNING session.
+        """
+
+        return await self._port_probe("127.0.0.1", self._forward_port)
 
     async def _stop(self) -> None:
         await self._proxy.stop()
@@ -184,6 +303,9 @@ class DeviceManager:
         proxy_base_port: int,
         poll_interval: float,
         include_serials: Optional[Sequence[str]] = None,
+        port_probe: Optional[PortProbe] = None,
+        sleep_fn: Optional[Sleeper] = None,
+        local_ips: Optional[Sequence[str]] = None,
     ) -> None:
         self._adb = adb_client
         self._listen_host = listen_host
@@ -196,6 +318,14 @@ class DeviceManager:
         self._next_proxy = proxy_base_port
         self._task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
+        self._port_probe: Optional[PortProbe] = port_probe
+        self._sleep_fn: Optional[Sleeper] = sleep_fn
+        # Local IPs (server's own addresses) used to detect self-referential
+        # devices: a client that ``adb connect``s to one of our proxy ports from
+        # this host would otherwise be reshared, recursing into our own proxy.
+        self._local_ips: set = set(local_ips or [])
+        self._local_ips.update({"127.0.0.1", "localhost", "0.0.0.0", "::1"})
+        self._reflection_logged: set = set()
 
     async def start(self) -> None:
         if self._task:
@@ -237,7 +367,16 @@ class DeviceManager:
         ready_devices = {device.serial: device for device in devices if device.is_ready}
         seen_serials = set(devices_by_serial(devices))
 
+        # Drop self-referential "reflection" devices before doing anything else.
+        # If someone runs ``adb connect <our-ip>:<our-proxy-port>`` on this host,
+        # adb registers it as a network device; sharing it would recurse through
+        # our own proxy (and running ``tcpip`` on it routes back to the real
+        # device and disrupts it). Such a device's host is one of our local IPs
+        # and its port is a proxy port we currently serve.
+        await self._drop_reflections(ready_devices)
+
         # Start or refresh sessions for ready devices.
+        started_this_cycle: set = set()
         for serial, device in ready_devices.items():
             session = self._sessions.get(serial)
             if not session:
@@ -249,19 +388,84 @@ class DeviceManager:
                     forward_port=ports.forward,
                     proxy_port=ports.proxy,
                     listen_host=self._listen_host,
+                    port_probe=self._port_probe,
+                    sleep_fn=self._sleep_fn,
                 )
                 self._sessions[serial] = session
             try:
-                await session.ensure_running(device)
+                if await session.ensure_running(device):
+                    started_this_cycle.add(serial)
             except Exception:
                 # ``ensure_running`` already logged details; keep looping for retries.
                 continue
+
+        # Self-heal: a RUNNING session whose forward silently died (transport
+        # race, USB glitch, adb server restart) would otherwise stay stuck. Skip
+        # sessions just started this cycle and those whose device is gone (the
+        # teardown pass below handles the latter).
+        for serial, session in list(self._sessions.items()):
+            if serial in started_this_cycle:
+                continue
+            if session.state != SessionState.RUNNING or serial not in ready_devices:
+                continue
+            try:
+                healthy = await session.is_forward_healthy()
+            except Exception as exc:  # pragma: no cover - probe is best-effort
+                _LOG.debug("Forward health check failed for %s: %s", serial, exc)
+                continue
+            if not healthy:
+                _LOG.warning("Dead forward detected for %s; re-setting up", serial)
+                await session.mark_unavailable("forward dead")
 
         # Tear down sessions for devices no longer available.
         for serial, session in list(self._sessions.items()):
             if serial not in ready_devices and session.state == SessionState.RUNNING:
                 reason = "not listed" if serial not in seen_serials else "not ready"
                 await session.mark_unavailable(reason)
+
+    def _is_reflection(self, serial: str, served_proxy_ports: set) -> bool:
+        """True if ``serial`` is a network device pointing at our own proxy.
+
+        A reflection has the form ``<local-ip>:<port>`` where ``port`` is one of
+        the proxy ports we currently serve. Real devices never satisfy both:
+        their host is not one of our local addresses and (for adb devices) their
+        port is not one of our proxy listeners.
+        """
+
+        host, sep, port_str = serial.rpartition(":")
+        if not sep or not port_str.isdigit():
+            return False
+        if int(port_str) not in served_proxy_ports:
+            return False
+        return host in self._local_ips
+
+    async def _drop_reflections(self, ready_devices: Dict[str, ADBDeviceInfo]) -> None:
+        """Remove self-referential devices from consideration and tear down any
+        session/ports we may have already allocated for them."""
+
+        served_proxy_ports = {ports.proxy for ports in self._port_state.values()}
+        for serial in list(ready_devices):
+            if not self._is_reflection(serial, served_proxy_ports):
+                continue
+            ready_devices.pop(serial, None)
+            session = self._sessions.pop(serial, None)
+            if session is not None:
+                await session.shutdown()
+            released = self._port_state.pop(serial, None)
+            if serial not in self._reflection_logged:
+                self._reflection_logged.add(serial)
+                detail = (
+                    f" (released ports forward={released.forward}/proxy={released.proxy})"
+                    if released
+                    else ""
+                )
+                _LOG.warning(
+                    "Skipping self-referential device %s: it points at this "
+                    "server's own proxy (someone ran `adb connect` to our proxy "
+                    "port from this host). Not re-sharing it.%s",
+                    serial,
+                    detail,
+                )
 
     async def _shutdown_sessions(self) -> None:
         for session in list(self._sessions.values()):

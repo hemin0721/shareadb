@@ -174,6 +174,44 @@ class ADBClient:
             check=False,
         )
 
+    async def wait_for_device(self, device_serial: str, *, timeout: float) -> ADBCommandResult:
+        """Block until ``device_serial`` reports the ``device`` state.
+
+        After ``adb tcpip`` restarts adbd the USB transport drops and reappears;
+        this gates on that transition so a subsequent ``forward`` does not bind
+        against a half-dead transport. Always bounded by ``timeout`` so callers
+        (and shutdown) cannot stall indefinitely.
+
+        Args:
+            device_serial: Device to wait for.
+            timeout: Maximum seconds to wait before raising ``asyncio.TimeoutError``.
+
+        Returns:
+            The ``ADBCommandResult`` from ``adb wait-for-device``.
+        """
+
+        return await self.run(
+            ["wait-for-device"],
+            device_serial=device_serial,
+            timeout=timeout,
+            check=True,
+        )
+
+    async def reconnect_offline(self, *, timeout: float = 5.0) -> ADBCommandResult:
+        """Best-effort nudge to re-handshake devices stuck in ``offline`` state.
+
+        Run with ``check=False`` because a non-zero exit is expected when no
+        offline devices exist; the caller ignores the result.
+
+        Args:
+            timeout: Maximum seconds for the command.
+
+        Returns:
+            The ``ADBCommandResult`` from ``adb reconnect offline``.
+        """
+
+        return await self.run(["reconnect", "offline"], check=False, timeout=timeout)
+
     async def list_devices(self) -> List[ADBDeviceInfo]:
         """Return all devices reported by ``adb devices -l``."""
 

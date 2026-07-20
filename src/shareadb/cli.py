@@ -119,6 +119,7 @@ async def main_async(args: argparse.Namespace) -> None:
         proxy_base_port=args.proxy_base_port,
         poll_interval=args.poll_interval,
         include_serials=args.include,
+        local_ips=get_local_ips(),
     )
 
     loop = asyncio.get_running_loop()
@@ -163,8 +164,10 @@ async def _status_logger(manager: DeviceManager, interval: float) -> None:
             if not statuses:
                 _LOG.info("No active adb devices detected")
             else:
+                local_ips = get_local_ips()
                 for status in statuses:
-                    _LOG.info("%s", _format_status(status))
+                    for ip in local_ips:
+                        _LOG.info("command: adb connect %s:%d %s", ip, status.proxy_port, _format_status(status))
     except asyncio.CancelledError:
         return
 
