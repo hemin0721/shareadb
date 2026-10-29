@@ -10,6 +10,15 @@ from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 _LOG = logging.getLogger(__name__)
 
+# Default upper bound applied to every adb invocation that does not pass an
+# explicit timeout (see ``ADBClient.run``). The local adb server can wedge
+# (deadlocked transport, half-dead device), and then the adb CLI never exits on
+# its own. Without a default bound ``DeviceManager._sync_devices`` would block
+# forever: the status cache would keep reporting the last known session state
+# ("running"), dead-forward self-heal would stop running, and only restarting
+# the script would bring sharing back — the failure mode seen in the field.
+DEFAULT_COMMAND_TIMEOUT = 30.0  # seconds
+
 
 @dataclass
 class ADBCommandResult:
@@ -98,7 +107,23 @@ class ADBClient:
         timeout: Optional[float] = None,
         check: bool = True,
     ) -> ADBCommandResult:
-        """Execute an adb sub-command asynchronously."""
+        """Execute an adb sub-command asynchronously.
+
+        Args:
+            args: adb sub-command arguments (after the optional ``-s serial``).
+            device_serial: Optional device to target.
+            timeout: Maximum seconds to wait for the command. ``None`` (the
+                default) uses ``DEFAULT_COMMAND_TIMEOUT`` so no adb call can
+                hang the caller forever; pass an explicit value to override.
+            check: Raise :class:`ADBCommandError` on a non-zero exit code.
+
+        Returns:
+            The command's stdout/stderr/returncode.
+
+        Raises:
+            asyncio.TimeoutError: The command exceeded ``timeout``; the
+                subprocess is killed before raising.
+        """
 
         cmd: List[str] = [str(self._adb_path)]
         if device_serial:
@@ -112,8 +137,11 @@ class ADBClient:
             stderr=asyncio.subprocess.PIPE,
         )
 
+        effective_timeout = DEFAULT_COMMAND_TIMEOUT if timeout is None else timeout
         try:
-            stdout_raw, stderr_raw = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout_raw, stderr_raw = await asyncio.wait_for(
+                process.communicate(), timeout=effective_timeout
+            )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -197,20 +225,36 @@ class ADBClient:
             check=True,
         )
 
-    async def reconnect_offline(self, *, timeout: float = 5.0) -> ADBCommandResult:
-        """Best-effort nudge to re-handshake devices stuck in ``offline`` state.
+    async def reconnect_offline(
+        self,
+        device_serial: Optional[str] = None,
+        *,
+        timeout: float = 5.0,
+    ) -> ADBCommandResult:
+        """Best-effort nudge to re-handshake device(s) stuck in ``offline`` state.
+
+        Scoped to ``device_serial`` when given so other devices on this host
+        (e.g. one a local scrcpy session is using) are never touched. A scoped
+        nudge is a no-op against a healthy device (verified: the transport is
+        not reset), so it is safe to call while a session is being set up.
 
         Run with ``check=False`` because a non-zero exit is expected when no
         offline devices exist; the caller ignores the result.
 
         Args:
+            device_serial: Device to nudge; ``None`` resets all offline devices.
             timeout: Maximum seconds for the command.
 
         Returns:
             The ``ADBCommandResult`` from ``adb reconnect offline``.
         """
 
-        return await self.run(["reconnect", "offline"], check=False, timeout=timeout)
+        return await self.run(
+            ["reconnect", "offline"],
+            device_serial=device_serial,
+            check=False,
+            timeout=timeout,
+        )
 
     async def list_devices(self) -> List[ADBDeviceInfo]:
         """Return all devices reported by ``adb devices -l``."""

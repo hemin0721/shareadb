@@ -91,6 +91,8 @@ shareadbpy --help
 - ✅ **Local IP Detection**: Automatically detects and displays local IP addresses
 - ✅ **Connection Monitoring**: Real-time device status and connection information
 - ✅ **Selective Sharing**: Share specific devices using `--include` parameter
+- ✅ **Access Control**: Allow-list / deny-list (`--allow` / `--deny`) with IP and CIDR support
+- ✅ **Connection Management**: Runtime admin console to list, kick and ban clients
 
 ## 项目结构
 
@@ -98,10 +100,12 @@ shareadbpy --help
 pyproject.toml        # 项目元数据与命令行入口
 src/shareadb/         # Python 源码目录
   __init__.py
+  access.py           # 连接访问控制策略（黑白名单，支持 IP/CIDR）
   adb_client.py       # 封装 adb 命令的异步客户端
+  admin_console.py    # 运行时管理控制台（clients/kick/ban/unban）
   cli.py              # 命令行入口，负责参数解析与事件循环
   device_manager.py   # 设备会话管理、端口分配与自动重连逻辑
-  tcp_proxy.py        # 基于 asyncio 的 TCP 代理实现
+  tcp_proxy.py        # 基于 asyncio 的 TCP 代理实现（含连接跟踪）
 ```
 
 ## 使用说明
@@ -118,6 +122,12 @@ python -m shareadb.cli --poll-interval 5 --status-interval 30
 - `--forward-base-port`: adb forward 起始端口，默认 `6000`
 - `--proxy-base-port`: TCP 代理起始端口，默认 `7000`
 - `--include`: 仅管理指定序列号的设备，例如 `--include SERIAL1 SERIAL2`
+- `--exclude`: 完全不碰的设备序列号（不执行 tcpip、不建 forward），例如本地正在用 scrcpy 的设备 `--exclude SERIAL`
+- `--allow`: 白名单模式，只允许列出的客户端 IP/CIDR 连接（本机回环默认放行），例如 `--allow 192.168.1.0/24 10.0.0.5`
+- `--deny`: 黑名单，拒绝列出的客户端 IP/CIDR（优先级高于 `--allow`），例如 `--deny 172.16.0.0/16`
+- `--blocklist-file`: 可选的黑名单文件（每行一个 IP/CIDR，支持 `#` 注释），启动时加载，运行时执行 `ban`/`unban` 会自动回写该文件
+
+访问控制规则同时支持 IPv4 与 IPv6；既有白名单又有黑名单时，黑名单优先。
 
 3. 程序会每隔 `poll-interval` 秒检测设备状态：
    - 新设备上线时自动配置 `adb tcp`、建立端口转发并启动本地代理；
@@ -126,6 +136,41 @@ python -m shareadb.cli --poll-interval 5 --status-interval 30
    - 设备连接成功后，会自动显示本机的所有可访问 IP 地址和对应的连接指令。
 
 远端用户只需连接到 `listen-host:proxy_port` 即可访问对应设备的 adb。每台设备都会分配一对唯一的 forward 与代理端口，并在设备重连后保持一致。
+
+## 与本地 adb 共存（scrcpy / Android Studio 等）
+
+本地工具（scrcpy、Android Studio、Chrome 调试等）和 shareadb 共用同一个 adb server 和设备的 USB 通道。shareadb 在设计上尽量避免干扰本地使用：
+
+- **设备已在 TCP 模式时不重启 adbd**：建立共享时先尝试直接建立端口转发，只有转发失败（设备确实处于 USB 模式）才执行 `adb tcpip`。设备设置了 `persist.adb.tcp.port`（或之前开启过共享）后，重启、插拔、自愈恢复都不会再重启 adbd，本地 scrcpy 的连接不受影响。
+- **首次开启 TCP 模式时** adbd 必须重启一次，本地 adb 连接会瞬断几秒——建议先启动 shareadb，等设备共享就绪后再启动 scrcpy。
+- **自愈防抖**：端口转发探测偶发失败不会立刻拆除重建（避免反复重启 adbd），先复测确认。
+- **按设备执行 adb 命令**：`adb reconnect offline` 等命令只作用于共享的设备，不影响本机其他设备。
+- **自动清理回环设备条目**：如果在本机执行了 `adb connect <本机IP>:<代理端口>`，会在 adb server 里残留一个"两条设备"的条目，导致 scrcpy 报 multiple devices 无法启动；shareadb 检测到后会自动 `adb disconnect` 清理。
+- **`--exclude` 彻底隔离**：不希望被共享管理的设备用 `--exclude SERIAL` 排除，shareadb 不会对它执行任何命令。
+
+## 连接管理
+
+服务运行期间，可以直接在终端输入管理命令（stdin 不可用时会自动关闭控制台，不影响访问控制规则）：
+
+```
+help              显示命令帮助
+status            查看设备共享状态
+clients           列出当前连接的客户端（IP、设备、连接时长、上下行流量）
+kick <ip|cidr>    断开匹配的连接（对方仍可重连）
+ban <ip|cidr>     拉黑并立即断开（之后的连接也会被拒绝）
+unban <ip|cidr>   解除拉黑
+policy            查看当前黑白名单及被拒绝的连接尝试统计
+```
+
+例如有人在持续连接你的设备，直接执行：
+
+```
+ban 10.0.0.9
+```
+
+该 IP 的现有连接会被立即断开，之后的连接尝试也会被拒绝并记录。若启动时指定了 `--blocklist-file`，拉黑名单会持久化到文件，重启后依然生效。
+
+被拒绝的连接会以 WARNING 级别记录日志（同一来源做了限频，避免刷屏），可通过 `policy` 命令查看各来源的尝试次数。
 
 ## 连接信息示例
 
@@ -196,6 +241,13 @@ shareadbpy --poll-interval 5 --status-interval 30
 - Ubuntu 下的单设备移除和恢复
 - Ubuntu 下的双设备移除和恢复
 - 使用 `--include` 参数在双设备环境下只共享指定设备
+- 设备已在 TCP 模式时共享/重连全程不重启 adbd（本地 scrcpy 不受影响）
+- 仅在设备处于 USB 模式时回退执行一次 `adb tcpip`
+- 端口探测瞬时失败被防抖拦截，不触发拆建循环
+- `--exclude` 排除的设备不被执行任何 adb 命令
+- 回环设备条目自动 `adb disconnect` 清理
+- `--deny` 拒绝指定 IP/CIDR 的连接，`--allow` 白名单模式仅放行指定网段
+- 运行时 `kick`/`ban`/`unban` 命令断开与拉黑客户端，`ban` 后重启仍被拒绝（配合 `--blocklist-file`）
 - 基础功能在 Linux 系统下运行正常
 
 ## License

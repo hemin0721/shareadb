@@ -209,3 +209,52 @@ def test_detect_providedPathMissing_raisesFileNotFoundError() -> None:
     with pytest.raises(FileNotFoundError):
         ADBClient.detect("/nonexistent/adb-binary")
 
+
+
+async def test_run_withoutExplicitTimeout_boundsCommandWithDefault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No adb call may hang forever -- the wedge behind "restart the script".
+
+    When the caller passes no explicit timeout, ``run`` must apply
+    ``DEFAULT_COMMAND_TIMEOUT``. A wedged adb server would otherwise block
+    ``DeviceManager._sync_devices`` permanently, freezing every session at its
+    last known state ("running") while dead-forward self-heal stops running.
+    """
+
+    # Arrange -- the real default must be a positive bound
+    from shareadb import adb_client as adb_mod
+
+    assert adb_mod.DEFAULT_COMMAND_TIMEOUT > 0
+    monkeypatch.setattr(adb_mod, "DEFAULT_COMMAND_TIMEOUT", 0.05)  # keep test fast
+
+    client = ADBClient("adb")
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.killed = False
+
+        @property
+        def returncode(self) -> int:
+            return 0
+
+        async def communicate(self):
+            await asyncio.sleep(100)  # wedged adb: never completes
+
+        def kill(self) -> None:
+            self.killed = True
+
+        async def wait(self) -> int:
+            return 0
+
+    proc = FakeProc()
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr("shareadb.adb_client.asyncio.create_subprocess_exec", fake_exec)
+
+    # Act / Assert -- note: no timeout argument given
+    with pytest.raises(asyncio.TimeoutError):
+        await client.run(["devices"])
+    assert proc.killed is True

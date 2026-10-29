@@ -28,6 +28,12 @@ class FakeADBClient:
         self.events: List[Event] = events if events is not None else []
         self.devices: List[ADBDeviceInfo] = []
         self._behaviors: Dict[str, List[BaseException]] = {}
+        # getprop answers (default: device in adb TCP mode on 5555). Tests that
+        # model a root/reboot wiping service.adb.tcp.port clear these entries.
+        self.props: Dict[str, str] = {
+            "service.adb.tcp.port": "5555",
+            "persist.adb.tcp.port": "",
+        }
 
     def set_devices(self, *serials_states: tuple) -> None:
         """Populate ``list_devices`` output from ``(serial, state)`` pairs."""
@@ -57,6 +63,9 @@ class FakeADBClient:
 
     # --- adb operations (signatures mirror ADBClient) ---
     async def list_devices(self) -> List[ADBDeviceInfo]:
+        # Emits no timeline event (existing adb_sequence assertions ignore
+        # listing), but scripted failures via fail("devices", exc) still apply.
+        self._apply("devices")
         return list(self.devices)
 
     async def run(
@@ -80,14 +89,23 @@ class FakeADBClient:
         timeout: Optional[float] = None,
     ) -> ADBCommandResult:
         self._record("shell")
-        return ADBCommandResult(stdout="", stderr="", returncode=0)
+        self._apply("shell")
+        stdout = ""
+        if len(shell_args) >= 2 and shell_args[0] == "getprop":
+            stdout = self.props.get(shell_args[1], "")
+        return ADBCommandResult(stdout=stdout, stderr="", returncode=0)
 
     async def wait_for_device(self, device_serial: str, *, timeout: float) -> ADBCommandResult:
         self._record("wait-for-device")
         self._apply("wait-for-device")
         return ADBCommandResult(stdout="", stderr="", returncode=0)
 
-    async def reconnect_offline(self, *, timeout: float = 5.0) -> ADBCommandResult:
+    async def reconnect_offline(
+        self,
+        device_serial: Optional[str] = None,
+        *,
+        timeout: float = 5.0,
+    ) -> ADBCommandResult:
         self._record("reconnect offline")
         self._apply("reconnect offline")
         return ADBCommandResult(stdout="", stderr="", returncode=0)
@@ -157,6 +175,7 @@ class FakeProxy:
     def __init__(self) -> None:
         self.started = False
         self.stopped = False
+        self.kick_patterns: List[str] = []
 
     async def start(self) -> None:
         self.started = True
@@ -164,6 +183,13 @@ class FakeProxy:
     async def stop(self) -> None:
         self.stopped = True
         self.started = False
+
+    def connections(self) -> List[Any]:
+        return []
+
+    def kick(self, pattern: str) -> int:
+        self.kick_patterns.append(pattern)
+        return 0
 
 
 class RunRecorder:
